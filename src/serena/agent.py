@@ -1168,9 +1168,12 @@ class SerenaAgent:
     def create_connection_prompt(self) -> str:
         """
         Returns the bootstrap prompt to be sent at MCP connection time.
+        context に ``connection_prompt`` があればその文字列を、無ければ既定のテンプレートから生成した文を返す。
 
         :return: the prompt
         """
+        if self._context.connection_prompt is not None:
+            return self._context.connection_prompt
         return self.prompt_factory.create_connection_prompt()
 
     def _create_global_memory_manager(self) -> MemoryManager:

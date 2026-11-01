@@ -44,3 +44,9 @@ single_project: false
 
 # whether to make MCP tools return structured output (null = auto-detect, true = always, false = never)
 structured_tool_output: null
+
+# MCP の接続時に server instructions としてクライアントに渡す文（null なら Serena の既定の文を使う。既定の文は
+# `initial_instructions` ツールを呼ぶよう促す）。Jinja2 のテンプレートとして描画せず、書いたとおりに渡す。
+# 空文字列（""）を書くと instructions は空になる。excluded_tools で `initial_instructions` を外す context では、
+# 既定の文が存在しないツールを呼ばせるので、ここにその context 用の案内文を書く。
+connection_prompt: null

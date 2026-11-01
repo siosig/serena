@@ -1,12 +1,17 @@
 """Tests for the mcp.py module in serena."""
 
+import logging
+from pathlib import Path
+
 import pytest
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.tools.base import Tool as MCPTool
 
 from serena.agent import Tool, ToolRegistry
 from serena.config.context_mode import SerenaAgentContext
+from serena.config.serena_config import SerenaConfig
 from serena.mcp import SerenaMCPFactory
+from serena.prompt_factory import SerenaPromptFactory
 from serena.repl.facade import ApiScope
 from serena.repl.repl import SerenaRepl
 
@@ -310,3 +315,84 @@ def test_make_tool_all_tools(tool_class) -> None:
 
     # The description should be a string (either from docstring or default)
     assert isinstance(mcp_tool.description, str)
+
+
+@pytest.fixture
+def headless_serena_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    MCP サーバーの生成時に、利用者の設定ファイルではなく GUI・ダッシュボードを切った設定を使わせる fixture。
+    """
+    config = SerenaConfig(log_level=logging.ERROR).with_headless_mode_overrides()
+
+    def from_config_file(cls: type[SerenaConfig], generate_if_missing: bool = True) -> SerenaConfig:
+        return config
+
+    monkeypatch.setattr(SerenaConfig, "from_config_file", classmethod(from_config_file))
+
+
+def _create_server_instructions(context: str) -> str | None:
+    """
+    指定した context (名前または YAML のパス) で作った MCP サーバーの instructions。
+    """
+    factory = SerenaMCPFactory(transport="stdio", context=context)
+    try:
+        server = factory.create_mcp_server(enable_web_dashboard=False, enable_gui_log_window=False, open_web_dashboard=False)
+        return server.instructions
+    finally:
+        if factory.agent is not None:
+            factory.agent.on_shutdown()
+
+
+def _write_context_yaml(tmp_path: Path, content: str) -> str:
+    """
+    指定した内容を書いた context の YAML のパス。
+    """
+    path = tmp_path / "custom_context.yml"
+    path.write_text(content, encoding="utf-8")
+    return str(path)
+
+
+@pytest.mark.usefixtures("headless_serena_config")
+@pytest.mark.parametrize(
+    ("yaml_content", "expected_instructions"),
+    [
+        pytest.param(
+            'prompt: ""\nconnection_prompt: |\n  Use the ssa tools.\n  {{ not_rendered }}\n',
+            "Use the ssa tools.\n{{ not_rendered }}\n",
+            id="multiline_not_rendered",
+        ),
+        pytest.param('prompt: ""\nconnection_prompt: ""\n', "", id="empty_string"),
+    ],
+)
+def test_context_connection_prompt_overrides_instructions(tmp_path: Path, yaml_content: str, expected_instructions: str) -> None:
+    """
+    指定した connection_prompt が、MCP サーバーの instructions をそのまま置き換えることを確かめる。
+    """
+    context_path = _write_context_yaml(tmp_path, yaml_content)
+
+    assert _create_server_instructions(context_path) == expected_instructions
+
+
+@pytest.mark.usefixtures("headless_serena_config")
+@pytest.mark.parametrize(
+    "yaml_content",
+    [
+        pytest.param('prompt: ""\n', id="key_absent"),
+        pytest.param('prompt: ""\nconnection_prompt: null\n', id="null"),
+    ],
+)
+def test_context_without_connection_prompt_uses_default_instructions(tmp_path: Path, yaml_content: str) -> None:
+    """
+    未指定の connection_prompt では、MCP サーバーの instructions が既定の connection_prompt になることを確かめる。
+    """
+    context_path = _write_context_yaml(tmp_path, yaml_content)
+
+    assert _create_server_instructions(context_path) == SerenaPromptFactory().create_connection_prompt()
+
+
+@pytest.mark.usefixtures("headless_serena_config")
+def test_builtin_context_uses_default_instructions() -> None:
+    """
+    組み込みの context では、MCP サーバーの instructions が既定の connection_prompt のままであることを確かめる。
+    """
+    assert _create_server_instructions("claude-code") == SerenaPromptFactory().create_connection_prompt()

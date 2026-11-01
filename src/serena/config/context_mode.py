@@ -190,6 +190,12 @@ class SerenaAgentContext(ToolInclusionDefinition, ApiInclusionDefinition, ToStri
     whether to use structured output for tools (None = auto)
     """
 
+    connection_prompt: str | None = None
+    """
+    MCP の接続時に server instructions としてクライアントに渡す文。None なら Serena の既定の connection_prompt を使う。
+    Jinja2 のテンプレートとして描画せず、書いたとおりに渡す。空文字列は指定ありとして扱い、instructions を空にする。
+    """
+
     def _tostring_includes(self) -> list[str]:
         return ["name"]
 
