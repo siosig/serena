@@ -281,3 +281,9 @@ vue-implementation/
 news/news.json
 test/resources/repos/vbnet/test_repo/obj/
 test/resources/repos/vbnet/test_repo/bin/
+
+# speckit の作業状態（ローカル専用。追跡しない）
+/.specify/
+/specs/
+/report/
+/tmp/
