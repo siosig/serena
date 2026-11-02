@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import collections
 import glob
 import json
 import os
@@ -8,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from collections.abc import Iterator, Sequence
 from logging import Logger
 from pathlib import Path
@@ -18,7 +16,6 @@ import click
 from sensai.util import logging
 from sensai.util.logging import FileLoggerContext, datetime_tag
 from sensai.util.string import dict_string
-from tqdm import tqdm
 
 from serena import serena_version
 from serena.config.client_setup import client_setup_handlers
@@ -42,6 +39,8 @@ from serena.constants import (
 from serena.language_backend import BuiltinLanguageBackend, LanguageBackendRegistry
 from serena.project import Project
 from serena.prompt_factory import SerenaPromptFactory
+from serena.source_file_indexer import SourceFileIndexer
+from serena.symbol_export import SymbolExport
 from serena.tools import ActivateProjectTool
 from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
@@ -587,6 +586,66 @@ class TopLevelCommands(AutoRegisteringGroup):
         viewer = SerenaDashboardViewer(url, width=width, height=height)
         viewer.run()
 
+    @staticmethod
+    @click.command(
+        "symbols",
+        help="Write the symbols (name path, kind, file, 1-based line range) of the project's source files to stdout as JSON. "
+        "Progress and diagnostics go to stderr. The paths restrict the export to the given files and directories.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("paths", nargs=-1, type=click.Path())
+    @click.option("--json", "as_json", is_flag=True, required=True, help="Write the symbols as JSON (currently the only format).")
+    @click.option(
+        "--project",
+        "project",
+        type=PROJECT_TYPE,
+        default=None,
+        help="Path or name of the project. Defaults to the project root found from the current directory.",
+    )
+    def symbols(paths: tuple[str, ...], as_json: bool, project: str | None) -> None:
+        # keep stdout free of anything but the JSON document
+        logging.configure(level=logging.WARNING, stream=sys.stderr)
+
+        project_location = project or find_project_root() or os.getcwd()
+        serena_config = SerenaConfig.from_config_file()
+        registered_project = serena_config.get_registered_project(project_location, autoregister=True)
+        if registered_project is None:
+            raise click.ClickException(f"No Serena project found for '{project_location}'; create one with `serena project index`.")
+        proj = registered_project.get_project_instance(serena_config=serena_config)
+
+        # resolve the files to export: the whole project or the given paths
+        files_by_path: dict[str, Project.ProjectFile] = {}
+        for relative_path in TopLevelCommands._relative_paths(proj, paths):
+            for project_file in proj.gather_source_files(relative_path=relative_path):
+                files_by_path[project_file.rel_path] = project_file
+
+        symbol_export = SymbolExport()
+        ls_mgr = proj.create_language_server_manager()
+        try:
+            outcome = SourceFileIndexer(ls_mgr).index(list(files_by_path.values()), on_document_symbols=symbol_export.add_file)
+        finally:
+            ls_mgr.stop_all()
+        for failed_path, exception in outcome.failures:
+            click.echo(f"Failed to read the symbols of {failed_path}: {exception}", err=True)
+        click.echo(symbol_export.to_json())
+
+    @staticmethod
+    def _relative_paths(proj: Project, paths: Sequence[str]) -> list[str]:
+        """
+        :param proj: the project
+        :param paths: paths given on the command line (relative to the current directory or absolute)
+        :return: the paths relative to the project root, with the empty path denoting the whole project when no paths were given
+        """
+        if not paths:
+            return [""]
+        relative_paths = []
+        for path in paths:
+            relative_path = os.path.relpath(os.path.abspath(path), proj.project_root)
+            if relative_path == os.pardir or relative_path.startswith(os.pardir + os.sep):
+                raise click.ClickException(f"'{path}' is outside of the project root {proj.project_root}.")
+            relative_paths.append("" if relative_path == os.curdir else relative_path)
+        return relative_paths
+
 
 class ModeCommands(AutoRegisteringGroup):
     """Group for 'mode' subcommands."""
@@ -913,38 +972,18 @@ class ProjectCommands(AutoRegisteringGroup):
         try:
             log_file = os.path.join(proj.project_root, ".serena", "logs", "indexing.txt")
 
-            files = proj.gather_source_files()
+            outcome = SourceFileIndexer(ls_mgr).index(proj.gather_source_files())
 
-            collected_exceptions: list[Exception] = []
-            files_failed = []
-            language_file_counts: dict[LanguageServerIdLike, int] = collections.defaultdict(lambda: 0)
-            last_save_time = time.monotonic()
-            for i, project_file in enumerate(tqdm(files, desc="Indexing")):
-                project_file: Project.ProjectFile
-                rel_path = project_file.rel_path
-                try:
-                    ls = ls_mgr.get_language_server(rel_path)
-                    ls.request_document_symbols(rel_path)
-                    language_file_counts[ls.ls_id] += 1
-                except Exception as e:
-                    log.error(f"Failed to index {rel_path}, continuing.")
-                    collected_exceptions.append(e)
-                    files_failed.append(rel_path)
-                now = time.monotonic()
-                if now - last_save_time >= 30:
-                    ls_mgr.save_all_caches()
-                    last_save_time = now
-            reported_language_file_counts = {k.get_key(): v for k, v in language_file_counts.items()}
+            reported_language_file_counts = {k.get_key(): v for k, v in outcome.language_file_counts.items()}
             click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")
-            ls_mgr.save_all_caches()
 
-            if len(files_failed) > 0:
+            if len(outcome.failures) > 0:
                 os.makedirs(os.path.dirname(log_file), exist_ok=True)
                 with open(log_file, "w", encoding="utf-8") as f:
-                    for file, exception in zip(files_failed, collected_exceptions, strict=True):
+                    for file, exception in outcome.failures:
                         f.write(f"{file}\n")
                         f.write(f"{exception}\n")
-                click.echo(f"Failed to index {len(files_failed)} files, see:\n{log_file}")
+                click.echo(f"Failed to index {len(outcome.failures)} files, see:\n{log_file}")
         finally:
             ls_mgr.stop_all()
 
